@@ -20,7 +20,7 @@ MAKEFUN_SHOP_TOKEN=test-token-123 node --experimental-strip-types main.ts
 
 ## Layout
 
-- `main.ts` — the entry ↔ env lifecycle (bind port 0, POST `/register`, poll `/done`). Kept as shipped in the starter.
+- `main.ts` — the entry ↔ env lifecycle (bind port 0, POST `/register`, poll `/done`), rewritten in our own style with the same behaviour as the starter lifecycle.
 - `app.ts` — the whole forge: git object store and pack codec (SHA-1 objects, zlib, ofs/ref deltas, sideband framing), smart-HTTP v2/v0, REST v3, GraphQL v4 and MCP. The only file that grew.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT).
 

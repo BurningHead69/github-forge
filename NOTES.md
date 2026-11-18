@@ -6,7 +6,7 @@ Account: make.fun @salik / GitHub BurningHead69. Deadline 2026-11-21T06:30:00Z (
 
 ## What is built
 
-Single file `app.ts` (1,528 lines, 77.6 KiB) + starter `main.ts` (unchanged), `package.json`,
+Single file `app.ts` (1,528 lines, 77.6 KiB) + `main.ts` (93 lines, rewritten in our own style with the same lifecycle as the starter), `package.json`,
 `tsconfig.json`, MIT `LICENSE`, `README.md`. Total entry size 104 KiB — far under the
 16 MiB total / 8 MiB per-file caps. Node stdlib only (`node:http`, `node:crypto`, `node:zlib`),
 no dependencies, no git binary at runtime, no network, one process, ephemeral port via `main.ts`.
