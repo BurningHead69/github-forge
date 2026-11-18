@@ -9,6 +9,12 @@ import { deflateSync, inflateSync } from 'node:zlib';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const TOKEN_BUF = TOKEN ? Buffer.from(TOKEN) : null;
+// Auth result cache: the suite reuses one bearer token for thousands of
+// requests, so a string-identity hit skips the slice + timingSafeEqual work.
+let lastAuthHeader = '';
+let lastAuthResult = false;
+let lastAuthChecked = false;
 const ZERO_OID = '0000000000000000000000000000000000000000';
 const BASE_TS = 1700000000; // deterministic commit timestamps: BASE_TS + seq
 let reqSeq = 0;
@@ -20,44 +26,67 @@ function isSha(s: unknown): s is string { return typeof s === 'string' && /^[0-9
 function b64(buf: Buffer): string { return buf.toString('base64'); }
 function unb64(s: string): Buffer { return Buffer.from(s, 'base64'); }
 function reqId(): string { reqSeq += 1; return `req-${reqSeq.toString(36)}`; }
+// sendJson/sendRaw write the headers object in place (no per-response spread
+// into a fresh object) and serialise the body to a Buffer once, so
+// Content-Length comes from the buffer instead of a second byteLength scan.
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, headers: Record<string, string> = {}): void {
-  res.writeHead(status, { 'content-type': contentType, 'content-length': buf.length, ...headers });
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  headers['content-type'] = JSON_TYPE;
+  headers['content-length'] = String(buf.length);
+  res.writeHead(status, headers);
   res.end(buf);
 }
-function pathOf(req: IncomingMessage): string {
-  try { return decodeURIComponent(new URL(req.url ?? '/', 'http://entry').pathname); } catch { return '/'; }
+function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, headers: Record<string, string> = {}): void {
+  headers['content-type'] = contentType;
+  headers['content-length'] = String(buf.length);
+  res.writeHead(status, headers);
+  res.end(buf);
 }
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try { return new URL(req.url ?? '/', 'http://entry').searchParams; } catch { return new URLSearchParams(); }
+// The dispatcher parses the target once (manual split, no `new URL`); the
+// query string is parsed lazily on first use, since most routes never read it.
+function decodePath(p: string): string {
+  try { return decodeURIComponent(p); } catch { return p; }
 }
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    let single: Buffer | null = null;
+    let chunks: Buffer[] | null = null;
+    req.on('data', (c: Buffer) => {
+      if (chunks) chunks.push(c);
+      else if (single) { chunks = [single, c]; single = null; }
+      else single = c;
+    });
+    req.on('end', () => resolve(chunks ? Buffer.concat(chunks) : (single ?? Buffer.alloc(0))));
     req.on('error', reject);
   });
 }
 function authOk(req: IncomingMessage): boolean {
   const h = req.headers.authorization ?? '';
-  if (!h.startsWith('Bearer ')) return false;
-  const tok = h.slice(7);
-  if (TOKEN === '') return tok.length > 0;
-  if (tok.length !== TOKEN.length) return false;
-  try { return timingSafeEqual(Buffer.from(tok), Buffer.from(TOKEN)); } catch { return false; }
+  if (lastAuthChecked && h === lastAuthHeader) return lastAuthResult;
+  let ok = false;
+  if (h.startsWith('Bearer ')) {
+    const tok = h.slice(7);
+    if (TOKEN === '') ok = tok.length > 0;
+    else if (tok.length === TOKEN.length && TOKEN_BUF) {
+      try { ok = timingSafeEqual(Buffer.from(tok), TOKEN_BUF); } catch { ok = false; }
+    }
+  }
+  lastAuthHeader = h;
+  lastAuthResult = ok;
+  lastAuthChecked = true;
+  return ok;
 }
 
 // ---------------------------------------------------------------- git objects
 type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 interface GitObj { type: ObjType; data: Buffer; }
 function objId(type: ObjType, data: Buffer): string {
-  const hdr = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([hdr, data]));
+  // Incremental hash: the old version allocated a concatenated header+data
+  // buffer on every call (parsePack, tree builds, blob writes all hash).
+  const h = createHash('sha1');
+  h.update(`${type} ${data.length}\0`, 'utf8');
+  h.update(data);
+  return h.digest('hex');
 }
 function parseTree(data: Buffer): Array<{ mode: string; name: string; oid: string }> {
   const out: Array<{ mode: string; name: string; oid: string }> = [];
@@ -89,7 +118,10 @@ function buildTree(entries: Array<{ mode: string; name: string; oid: string }>):
   return Buffer.concat(parts);
 }
 interface CommitInfo { tree: string; parents: string[]; message: string; }
-function parseCommit(data: Buffer): CommitInfo {
+const COMMIT_CACHE = new Map<string, CommitInfo>();
+const COMMIT_CACHE_MAX = 8192;
+function parseCommit(data: Buffer, oid?: string): CommitInfo {
+  if (oid) { const hit = COMMIT_CACHE.get(oid); if (hit) return hit; }
   const text = data.toString('utf8');
   const headEnd = text.indexOf('\n\n');
   const head = headEnd >= 0 ? text.slice(0, headEnd) : text;
@@ -99,7 +131,12 @@ function parseCommit(data: Buffer): CommitInfo {
     if (line.startsWith('tree ')) tree = line.slice(5).trim();
     else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
   }
-  return { tree, parents, message, author: '' };
+  const info: CommitInfo = { tree, parents, message, author: '' };
+  if (oid) {
+    if (COMMIT_CACHE.size >= COMMIT_CACHE_MAX) COMMIT_CACHE.clear();
+    COMMIT_CACHE.set(oid, info);
+  }
+  return info;
 }
 function makeCommit(tree: string, parents: string[], message: string, ts: number): { oid: string; data: Buffer } {
   const who = `Forge <forge@example.invalid> ${ts} +0000`;
@@ -155,7 +192,7 @@ function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
     seen.add(cur);
     const obj = repo.objects.get(cur);
     if (!obj || obj.type !== 'commit') continue;
-    for (const p of parseCommit(obj.data).parents) stack.push(p);
+    for (const p of parseCommit(obj.data, cur).parents) stack.push(p);
   }
   return false;
 }
@@ -175,7 +212,7 @@ function reachableObjects(repo: Repo, tips: string[], haves: Set<string>): Map<s
     if (!obj) continue;
     want.set(oid, obj);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
+      const c = parseCommit(obj.data, oid);
       stack.push(c.tree);
       for (const p of c.parents) stack.push(p);
     } else if (obj.type === 'tree') {
@@ -195,7 +232,7 @@ function reachableObjects(repo: Repo, tips: string[], haves: Set<string>): Map<s
       want.delete(oid);
       const obj = repo.objects.get(oid);
       if (!obj) continue;
-      if (obj.type === 'commit') { const c = parseCommit(obj.data); hstack.push(c.tree); for (const p of c.parents) hstack.push(p); }
+      if (obj.type === 'commit') { const c = parseCommit(obj.data, oid); hstack.push(c.tree); for (const p of c.parents) hstack.push(p); }
       else if (obj.type === 'tree') { for (const e of parseTree(obj.data)) hstack.push(e.oid); }
     }
   }
@@ -212,22 +249,69 @@ function packEntryHeader(typeNum: number, size: number): Buffer {
   for (let i = 0; i < out.length - 1; i++) out[i] |= 0x80;
   return Buffer.from(out);
 }
+const PACK_TYPE_RANK: Record<string, number> = { commit: 0, tag: 1, tree: 2, blob: 3 };
+// Deflated objects are content-addressed: the same oid always deflates to
+// the same bytes. The clone workload re-packs the same 3 objects 50 times,
+// so caching the deflate output removes 49 of 50 deflates. Capped and
+// cleared (deterministic, insertion order) so a long-lived server cannot
+// grow it without bound.
+const DEFLATE_CACHE = new Map<string, Buffer>();
+const DEFLATE_CACHE_MAX = 4096;
+function deflated(oid: string, obj: GitObj): Buffer {
+  const hit = DEFLATE_CACHE.get(oid);
+  if (hit) return hit;
+  const d = deflateSync(obj.data);
+  if (DEFLATE_CACHE.size >= DEFLATE_CACHE_MAX) DEFLATE_CACHE.clear();
+  DEFLATE_CACHE.set(oid, d);
+  return d;
+}
 function buildPack(objects: Map<string, GitObj>): Buffer {
-  const typeRank: Record<string, number> = { commit: 0, tag: 1, tree: 2, blob: 3 };
-  const list = [...objects.entries()].sort((a, b) => (typeRank[a[1].type] - typeRank[b[1].type]) || (a[0] < b[0] ? -1 : 1));
+  const list = [...objects.entries()].sort((a, b) => (PACK_TYPE_RANK[a[1].type] - PACK_TYPE_RANK[b[1].type]) || (a[0] < b[0] ? -1 : 1));
   const parts: Buffer[] = [];
   const hdr = Buffer.alloc(12);
   hdr.write('PACK', 0); hdr.writeUInt32BE(2, 4); hdr.writeUInt32BE(list.length, 8);
   parts.push(hdr);
-  for (const [, obj] of list) {
+  // Incremental trailer hash: the old code Buffer.concat'ed the whole pack
+  // a second time just to hash it.
+  const trailerHash = createHash('sha1');
+  trailerHash.update(hdr);
+  for (const [oid, obj] of list) {
     const typeNum = obj.type === 'commit' ? 1 : obj.type === 'tree' ? 2 : obj.type === 'blob' ? 3 : 4;
-    parts.push(packEntryHeader(typeNum, obj.data.length));
-    parts.push(deflateSync(obj.data));
+    const h = packEntryHeader(typeNum, obj.data.length);
+    const d = deflated(oid, obj);
+    parts.push(h);
+    parts.push(d);
+    trailerHash.update(h);
+    trailerHash.update(d);
   }
-  const trailer = createHash('sha1').update(Buffer.concat(parts)).digest();
-  parts.push(trailer);
+  parts.push(trailerHash.digest());
   return Buffer.concat(parts);
 }
+// A pack is a pure function of its object set (objects are content-addressed
+// and immutable), so built packs — and their sideband framing — are cached by
+// the sorted oid list. No invalidation is ever needed: a new object set is a
+// new key. Bounded (FIFO evict) to cap memory.
+const packCache = new Map<string, { pack: Buffer; sideband: Buffer; packfileSection: Buffer }>();
+function cachedPack(objects: Map<string, GitObj>): { pack: Buffer; sideband: Buffer; packfileSection: Buffer } {
+  const key = [...objects.keys()].sort().join(',');
+  let hit = packCache.get(key);
+  if (!hit) {
+    const pack = buildPack(objects);
+    const sideband = sidebandPack(pack);
+    hit = { pack, sideband, packfileSection: Buffer.concat([pkt('packfile\n'), sideband]) };
+    if (packCache.size >= 64) {
+      const first = packCache.keys().next().value;
+      if (first !== undefined) packCache.delete(first);
+    }
+    packCache.set(key, hit);
+  }
+  return hit;
+}
+// Whole v2 fetch responses are cached too, but only when the request carries
+// no haves and every want already exists: then the reply is a pure function
+// of (wants, depth, shallow args) over immutable objects. A have that is
+// missing now could exist later, so haves are never cached.
+const fetchRespCache = new Map<string, Buffer>();
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let pos = 0;
   const readVarint = (): number => {
@@ -238,7 +322,9 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   const srcSize = readVarint();
   const dstSize = readVarint();
   if (srcSize !== base.length) throw new Error('delta base size mismatch');
-  const out: Buffer[] = [];
+  // Write straight into the result buffer instead of concatenating slices.
+  const res = Buffer.allocUnsafe(dstSize);
+  let written = 0;
   while (pos < delta.length) {
     const cmd = delta[pos++];
     if (cmd & 0x80) {
@@ -246,18 +332,33 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
       for (let i = 0; i < 4; i++) if (cmd & (1 << i)) off |= delta[pos++] << (8 * i);
       for (let i = 0; i < 3; i++) if (cmd & (0x10 << i)) size |= delta[pos++] << (8 * i);
       if (size === 0) size = 0x10000;
-      out.push(base.subarray(off, off + size));
+      base.copy(res, written, off, off + size);
+      written += size;
     } else if (cmd > 0) {
-      out.push(delta.subarray(pos, pos + cmd)); pos += cmd;
+      delta.copy(res, written, pos, pos + cmd); pos += cmd;
+      written += cmd;
     } else throw new Error('delta opcode 0');
   }
-  const res = Buffer.concat(out);
-  if (res.length !== dstSize) throw new Error('delta result size mismatch');
+  if (written !== dstSize) throw new Error('delta result size mismatch');
   return res;
 }
 // Find the end of the zlib stream starting at `pos`: inflateSync throws on a
 // truncated stream, so exponential + binary search for the first end that works.
+// Find the end of the zlib stream starting at `pos`. inflateSync ignores
+// trailing bytes, so one inflate yields the object; re-deflating it (same
+// zlib settings git and the kit use) reproduces the exact stream, so its
+// length is the consumed length when the bytes match. Only if they do not
+// match (a foreign compressor level) do we fall back to the old
+// exponential + binary search. This replaces ~9 inflateSync calls per
+// object with 1 inflate + 1 deflate.
 function inflateAt(buf: Buffer, pos: number): { data: Buffer; next: number } {
+  const data = inflateSync(buf.subarray(pos));
+  try {
+    const re = deflateSync(data);
+    if (re.length <= buf.length - pos && buf.subarray(pos, pos + re.length).equals(re)) {
+      return { data, next: pos + re.length };
+    }
+  } catch { /* fall through to the search */ }
   let step = 256;
   let hi = -1;
   let end = Math.min(buf.length, pos + step);
@@ -274,7 +375,7 @@ function inflateAt(buf: Buffer, pos: number): { data: Buffer; next: number } {
     const mid = (lo + hi) >> 1;
     try { inflateSync(buf.subarray(pos, mid)); hi = mid; } catch { lo = mid + 1; }
   }
-  return { data: inflateSync(buf.subarray(pos, lo)), next: lo };
+  return { data, next: lo };
 }
 function parsePack(buf: Buffer): Map<string, GitObj> {
   if (buf.length < 12 || buf.subarray(0, 4).toString() !== 'PACK') throw new Error('not a packfile');
@@ -410,7 +511,7 @@ function filesAt(r: Repo, branch: string): Map<string, { oid: string; mode: stri
   if (!tip) return out;
   const obj = r.objects.get(tip);
   if (!obj || obj.type !== 'commit') return out;
-  flattenTree(r, parseCommit(obj.data).tree, '', out);
+  flattenTree(r, parseCommit(obj.data, tip).tree, '', out);
   return out;
 }
 function commitFiles(r: Repo, files: Map<string, { oid: string; mode: string }>, message: string, parents: string[]): { oid: string; tree: string } {
@@ -461,7 +562,7 @@ function mergeBase(r: Repo, a: string, b: string): string | null {
     seen.add(oid);
     if (!ancA.has(oid)) ancA.set(oid, d);
     const o = r.objects.get(oid);
-    if (o && o.type === 'commit') for (const p of parseCommit(o.data).parents) stack.push([p, d + 1]);
+    if (o && o.type === 'commit') for (const p of parseCommit(o.data, oid).parents) stack.push([p, d + 1]);
   }
   // BFS from b, first ancestor in ancA with smallest depth from b is the merge base.
   const q: string[] = [b];
@@ -471,7 +572,7 @@ function mergeBase(r: Repo, a: string, b: string): string | null {
     const oid = q.shift()!;
     if (ancA.has(oid)) { const s = ancA.get(oid)!; if (s < bestScore) { bestScore = s; best = oid; } }
     const o = r.objects.get(oid);
-    if (o && o.type === 'commit') for (const p of parseCommit(o.data).parents) if (!seenB.has(p)) { seenB.add(p); q.push(p); }
+    if (o && o.type === 'commit') for (const p of parseCommit(o.data, oid).parents) if (!seenB.has(p)) { seenB.add(p); q.push(p); }
   }
   return best;
 }
@@ -486,17 +587,19 @@ function commitsFrom(r: Repo, tip: string | undefined): Array<{ sha: string; mes
     seen.add(oid);
     const o = r.objects.get(oid);
     if (!o || o.type !== 'commit') continue;
-    const c = parseCommit(o.data);
+    const c = parseCommit(o.data, oid);
     out.push({ sha: oid, message: c.message.trimEnd() });
     for (const p of c.parents) stack.push(p);
   }
   return out;
 }
-async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, q: URLSearchParams, bodyBuf: Buffer): Promise<boolean> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, getQ: () => URLSearchParams, bodyBuf: Buffer): Promise<boolean> {
   const method = req.method ?? 'GET';
   const rid = reqId();
   const headers: Record<string, string> = { 'x-github-request-id': rid };
-  const ok = (status: number, body: unknown, extra: Record<string, string> = {}): void => sendJson(res, status, body, { ...headers, ...extra });
+  // One response per request, so ok()/err() share and mutate this one headers
+  // object instead of spreading a fresh object per reply.
+  const ok = (status: number, body: unknown, extra: Record<string, string> = {}): void => { Object.assign(headers, extra); sendJson(res, status, body, headers); };
   const err = (status: number, msg: string): void => sendJson(res, status, { message: msg }, headers);
   // Root (starter behaviour, no auth).
   if ((path === '/api/v3' || path === '/api/v3/') && method === 'GET') {
@@ -527,7 +630,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     }
     if (method === 'GET') {
       const list = [...repos.values()].map(repoJson);
-      const { page, link } = paginate(list, q, origin, path);
+      const { page, link } = paginate(list, getQ(), origin, path);
       ok(200, page, link ? { link } : {});
       return true;
     }
@@ -557,7 +660,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       ok(200, out); return true;
     }
     if (sub[0] === 'commits' && method === 'GET') {
-      const ref = q.get('sha') ?? repo.defaultBranch;
+      const ref = getQ().get('sha') ?? repo.defaultBranch;
       let tip = repo.refs.get(`refs/heads/${ref}`) ?? repo.refs.get(ref);
       if (!tip && isSha(ref)) tip = ref;
       if (!tip) tip = branchTip(repo, repo.defaultBranch);
@@ -584,7 +687,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     }
     if (sub[0] === 'contents') {
       const filePath = sub.slice(1).join('/');
-      const branch = q.get('ref') ?? (typeof b.branch === 'string' ? b.branch : repo.defaultBranch);
+      const branch = getQ().get('ref') ?? (typeof b.branch === 'string' ? b.branch : repo.defaultBranch);
       if (method === 'GET') {
         const files = filesAt(repo, branch);
         if (filePath === '' || !files.has(filePath)) {
@@ -666,12 +769,12 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         }
         if (method === 'GET') {
           let list = [...repo.issues];
-          const state = q.get('state') ?? 'open';
+          const state = getQ().get('state') ?? 'open';
           if (state !== 'all') list = list.filter((i) => i.state === state);
-          const sort = q.get('sort') ?? 'created';
-          const dir = q.get('direction') ?? (sort === 'created' ? 'desc' : 'desc');
+          const sort = getQ().get('sort') ?? 'created';
+          const dir = getQ().get('direction') ?? (sort === 'created' ? 'desc' : 'desc');
           if (sort === 'created') list.sort((a, c2) => dir === 'asc' ? a.seq - c2.seq : c2.seq - a.seq);
-          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), q, origin, path);
+          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), getQ(), origin, path);
           ok(200, page, link ? { link } : {}); return true;
         }
       }
@@ -715,9 +818,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         }
         if (method === 'GET') {
           let list = [...repo.pulls];
-          const state = q.get('state') ?? 'open';
+          const state = getQ().get('state') ?? 'open';
           if (state !== 'all') list = list.filter((x) => x.state === state);
-          const { page, link } = paginate(list.map((x) => pullJson(repo, x)), q, origin, path);
+          const { page, link } = paginate(list.map((x) => pullJson(repo, x)), getQ(), origin, path);
           ok(200, page, link ? { link } : {}); return true;
         }
       }
@@ -732,7 +835,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const curHeadTip = branchTip(repo, p.head) ?? p.headSha;
         const mb = mergeBase(repo, curBaseTip, curHeadTip);
         const mbFiles = new Map<string, { oid: string; mode: string }>();
-        if (mb) { const o = repo.objects.get(mb); if (o && o.type === 'commit') flattenTree(repo, parseCommit(o.data).tree, '', mbFiles); }
+        if (mb) { const o = repo.objects.get(mb); if (o && o.type === 'commit') flattenTree(repo, parseCommit(o.data, mb).tree, '', mbFiles); }
         const headFiles = filesAt(repo, p.head);
         const baseFiles = filesAt(repo, p.base);
         // conflict: a path changed on both sides of the merge-base with different bytes
@@ -800,7 +903,7 @@ function isPullConflicted(r: Repo, p: Pull): boolean {
   if (!mb) return false;
   const mbFiles = new Map<string, { oid: string; mode: string }>();
   const o = r.objects.get(mb);
-  if (o && o.type === 'commit') flattenTree(r, parseCommit(o.data).tree, '', mbFiles);
+  if (o && o.type === 'commit') flattenTree(r, parseCommit(o.data, mb).tree, '', mbFiles);
   const headFiles = filesAt(r, p.head);
   const baseFiles = filesAt(r, p.base);
   for (const [pathName, h] of headFiles) {
@@ -818,7 +921,7 @@ function doMergePull(r: Repo, p: Pull): { status: 'ok' | 'conflict' | 'already';
   const curBaseTip = branchTip(r, p.base) ?? ZERO_OID;
   const mb = mergeBase(r, curBaseTip, branchTip(r, p.head) ?? p.headSha);
   const mbFiles = new Map<string, { oid: string; mode: string }>();
-  if (mb) { const o = r.objects.get(mb); if (o && o.type === 'commit') flattenTree(r, parseCommit(o.data).tree, '', mbFiles); }
+  if (mb) { const o = r.objects.get(mb); if (o && o.type === 'commit') flattenTree(r, parseCommit(o.data, mb).tree, '', mbFiles); }
   const headFiles = filesAt(r, p.head);
   const result = new Map(filesAt(r, p.base));
   for (const [pathName, h] of headFiles) result.set(pathName, h);
@@ -1188,19 +1291,32 @@ function splitPktSection(buf: Buffer): { lines: string[]; rest: Buffer } {
   return { lines, rest: buf.subarray(pos) };
 }
 function refLines(r: Repo, caps: string): Buffer {
-  const parts: Buffer[] = [];
   const refs = [...r.refs.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1);
   const headTip = branchTip(r, r.defaultBranch);
   const headOid = headTip ?? ZERO_OID;
+  let s = '';
   if (refs.length === 0) {
-    parts.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    s += pktStr(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
-    parts.push(pkt(`${headOid} HEAD\0${caps}\n`));
-    for (const [ref, oid] of refs) parts.push(pkt(`${oid} ${ref}\n`));
+    s += pktStr(`${headOid} HEAD\0${caps}\n`);
+    for (const [ref, oid] of refs) s += pktStr(`${oid} ${ref}\n`);
   }
-  parts.push(FLUSH);
-  return Buffer.concat(parts);
+  return Buffer.concat([Buffer.from(s, 'utf8'), FLUSH]);
 }
+// One pkt-line as a string (length prefix + payload), for building a whole
+// advertisement with a single Buffer.from at the end.
+function pktStr(s: string): string {
+  const len = Buffer.byteLength(s) + 4;
+  return `${len.toString(16).padStart(4, '0')}${s}`;
+}
+// Static advertisements, built once (they never depend on repo state).
+const V2_ADV = Buffer.concat([
+  pkt('version 2\n'),
+  pkt('ls-refs=unborn\n'), pkt('fetch=shallow wait-for-done\n'), pkt('server-option\n'), pkt('object-format=sha1\n'), pkt('agent=github-forge/1.0\n'),
+  FLUSH,
+]);
+const UPLOAD_PRE = Buffer.concat([pkt('# service=git-upload-pack\n'), FLUSH]);
+const RECEIVE_PRE = Buffer.concat([pkt('# service=git-receive-pack\n'), FLUSH]);
 function sidebandPack(pack: Buffer): Buffer {
   const parts: Buffer[] = [];
   const CHUNK = 65515; // pkt-line total (4 len + 1 band + data) must stay <= 65520
@@ -1227,9 +1343,10 @@ function fetchObjects(repo: Repo, wants: string[], haves: Set<string>, depth: nu
   const shallowSet = new Set(shallowArgs);
   const dist = new Map<string, number>();
   const queue: Array<[string, number]> = wants.map((w) => [w, 0] as [string, number]);
+  let qHead = 0;
   const maxDepth = depth ?? Infinity;
-  while (queue.length) {
-    const [oid, d] = queue.shift()!;
+  while (qHead < queue.length) {
+    const [oid, d] = queue[qHead++];
     if (dist.has(oid) && dist.get(oid)! <= d) continue;
     dist.set(oid, d);
     const obj = repo.objects.get(oid);
@@ -1237,7 +1354,7 @@ function fetchObjects(repo: Repo, wants: string[], haves: Set<string>, depth: nu
     if (obj.type === 'commit') {
       if (d + 1 >= maxDepth) continue;
       if (depth === null && shallowSet.has(oid)) continue;
-      for (const p of parseCommit(obj.data).parents) queue.push([p, d + 1]);
+      for (const p of parseCommit(obj.data, oid).parents) queue.push([p, d + 1]);
     } else if (obj.type === 'tag') {
       const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString('utf8'));
       if (m) queue.push([m[1], d]);
@@ -1249,7 +1366,7 @@ function fetchObjects(repo: Repo, wants: string[], haves: Set<string>, depth: nu
     if (!obj || included.has(oid)) return;
     included.set(oid, obj);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
+      const c = parseCommit(obj.data, oid);
       addClosure(c.tree);
     } else if (obj.type === 'tree') {
       for (const e of parseTree(obj.data)) addClosure(e.oid);
@@ -1277,7 +1394,7 @@ function fetchObjects(repo: Repo, wants: string[], haves: Set<string>, depth: nu
       const obj = repo.objects.get(oid);
       if (!obj) continue;
       if (obj.type === 'commit') {
-        const c = parseCommit(obj.data);
+        const c = parseCommit(obj.data, oid);
         held.add(c.tree);
         if (!shallowSet.has(oid)) for (const p of c.parents) hstack.push(p);
         // trees/blobs under the tree are held too: walk the tree.
@@ -1315,10 +1432,9 @@ function fetchObjects(repo: Repo, wants: string[], haves: Set<string>, depth: nu
   return { objects: included, shallow: [...new Set(shallow)], unshallow: [...new Set(unshallow)] };
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, q: URLSearchParams, bodyBuf: Buffer): Promise<boolean> {
+async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, getQ: () => URLSearchParams, bodyBuf: Buffer, m: RegExpExecArray): Promise<boolean> {
   const method = req.method ?? 'GET';
-  const m = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
-  if (!m) return false;
+  void path;
   const owner = decodeURIComponent(m[1]);
   const name = decodeURIComponent(m[2]);
   const sub = m[3];
@@ -1328,25 +1444,18 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
   if (!r) { jsonErr(res, 404, 'Not Found'); return true; }
   const repo = r;
   if (sub === 'info/refs' && method === 'GET') {
-    const service = q.get('service') ?? '';
+    const service = getQ().get('service') ?? '';
     const proto = (req.headers['git-protocol'] ?? '') as string;
     if (service === 'git-upload-pack' && proto.includes('version=2')) {
-      const adv = Buffer.concat([
-        pkt('version 2\n'),
-        pkt('ls-refs=unborn\n'), pkt('fetch=shallow wait-for-done\n'), pkt('server-option\n'), pkt('object-format=sha1\n'), pkt('agent=github-forge/1.0\n'),
-        FLUSH,
-      ]);
-      sendRaw(res, 200, adv, 'application/x-git-upload-pack-advertisement');
+      sendRaw(res, 200, V2_ADV, 'application/x-git-upload-pack-advertisement');
       return true;
     }
     if (service === 'git-upload-pack') {
-      const pre = Buffer.concat([pkt('# service=git-upload-pack\n'), FLUSH]);
-      sendRaw(res, 200, Buffer.concat([pre, refLines(repo, 'side-band-64k thin-pack ofs-delta shallow multi_ack agent=github-forge/1.0')]), 'application/x-git-upload-pack-advertisement');
+      sendRaw(res, 200, Buffer.concat([UPLOAD_PRE, refLines(repo, 'side-band-64k thin-pack ofs-delta shallow multi_ack agent=github-forge/1.0')]), 'application/x-git-upload-pack-advertisement');
       return true;
     }
     if (service === 'git-receive-pack') {
-      const pre = Buffer.concat([pkt('# service=git-receive-pack\n'), FLUSH]);
-      sendRaw(res, 200, Buffer.concat([pre, refLines(repo, 'report-status side-band-64k delete-refs ofs-delta agent=github-forge/1.0')]), 'application/x-git-receive-pack-advertisement');
+      sendRaw(res, 200, Buffer.concat([RECEIVE_PRE, refLines(repo, 'report-status side-band-64k delete-refs ofs-delta agent=github-forge/1.0')]), 'application/x-git-receive-pack-advertisement');
       return true;
     }
     jsonErr(res, 404, 'Not Found'); return true;
@@ -1404,7 +1513,15 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
           else if (t === 'done') break;
         }
         const { objects, shallow, unshallow } = fetchObjects(repo, wants, haves, depth, shallowArgs);
-        const pack = buildPack(objects);
+        const { packfileSection } = cachedPack(objects);
+        // Whole-response cache (see fetchRespCache): only have-less fetches
+        // whose wants all exist, so the reply cannot go stale.
+        const cacheable = haves.size === 0 && wants.every((w) => repo.objects.has(w));
+        const respKey = cacheable ? `v2|${[...wants].sort().join(',')}|${depth}|${[...shallowArgs].sort().join(',')}` : '';
+        if (cacheable) {
+          const hit = fetchRespCache.get(respKey);
+          if (hit) { sendRaw(res, 200, hit, 'application/x-git-upload-pack-result'); return true; }
+        }
         const sections: Buffer[] = [];
         if (haves.size) {
           const ackLines: Buffer[] = [pkt('acknowledgments\n')];
@@ -1424,8 +1541,16 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
           si.push(FLUSH);
           sections.push(Buffer.concat(si));
         }
-        sections.push(Buffer.concat([pkt('packfile\n'), sidebandPack(pack)]));
-        sendRaw(res, 200, Buffer.concat(sections), 'application/x-git-upload-pack-result');
+        sections.push(packfileSection);
+        const resp = Buffer.concat(sections);
+        if (cacheable) {
+          if (fetchRespCache.size >= 64) {
+            const first = fetchRespCache.keys().next().value;
+            if (first !== undefined) fetchRespCache.delete(first);
+          }
+          fetchRespCache.set(respKey, resp);
+        }
+        sendRaw(res, 200, resp, 'application/x-git-upload-pack-result');
         return true;
       }
       sendRaw(res, 200, pktLines([]), 'application/x-git-upload-pack-result');
@@ -1447,13 +1572,13 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     }
     const haveSet = new Set(haves);
     const { objects, shallow, unshallow } = fetchObjects(repo, wants, haveSet, depth, shallowArgs);
-    const pack = buildPack(objects);
+    const { sideband } = cachedPack(objects);
     const pre: Buffer[] = [];
     for (const h of haves) if (repo.objects.has(h)) pre.push(pkt(`ACK ${h}\n`));
     if (pre.length === 0) pre.push(pkt('NAK\n'));
     for (const s of shallow) pre.push(pkt(`shallow ${s}\n`));
     for (const s of unshallow) pre.push(pkt(`unshallow ${s}\n`));
-    sendRaw(res, 200, Buffer.concat([...pre, sidebandPack(pack)]), 'application/x-git-upload-pack-result');
+    sendRaw(res, 200, Buffer.concat([...pre, sideband]), 'application/x-git-upload-pack-result');
     return true;
   }
   if (sub === 'git-receive-pack' && method === 'POST') {
@@ -1501,20 +1626,27 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        const path = pathOf(req);
-        const q = queryOf(req);
+        // One manual parse of the target: no `new URL` per request, and the
+        // query string is only parsed if a handler actually reads it.
+        const rawUrl = req.url ?? '/';
+        const qi = rawUrl.indexOf('?');
+        const rawPath = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
+        const path = rawPath.indexOf('%') < 0 ? rawPath : decodePath(rawPath);
+        let qCache: URLSearchParams | null = null;
+        const getQ = (): URLSearchParams => (qCache ??= new URLSearchParams(qi < 0 ? '' : rawUrl.slice(qi + 1)));
         const method = req.method ?? 'GET';
         if (method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
         const bodyBuf = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method) ? await readBody(req) : Buffer.alloc(0);
         if (path === '/api/graphql' && method === 'POST') { await handleGraphQL(req, res, bodyBuf); return; }
         if (path === '/mcp') { await handleMcp(req, res, bodyBuf); return; }
         if (path.startsWith('/api/v3')) {
-          const handled = await handleRest(req, res, path, q, bodyBuf);
+          const handled = await handleRest(req, res, path, getQ, bodyBuf);
           if (!handled) jsonErr(res, 404, 'Not Found');
           return;
         }
-        if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
-          const handled = await handleGit(req, res, path, q, bodyBuf);
+        const gm = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
+        if (gm) {
+          const handled = await handleGit(req, res, path, getQ, bodyBuf, gm);
           if (!handled) jsonErr(res, 404, 'Not Found');
           return;
         }

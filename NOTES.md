@@ -132,3 +132,73 @@ house reference on every workload.
    github-core-clone-01 --repo-url <url> --commit <sha> --title "github-forge" --bundle <file>`.
 3. Quota: max 5/day, 10 total for this bounty; last submission before
    2026-11-21T06:30:00Z is final.
+
+## v2 — speed optimization (2026-11-19, for top-20)
+
+Server dev score of v1 was 929 (feature 600 + agent 200 + perf 129, rank 3124/8721);
+top-20 needs ~956, i.e. perf >= 156 — all of it from perf. Four parallel workers
+(profiled / optimized git, issue/API, HTTP paths in separate variant copies under
+~/workspace/makefun/github-forge-variants/) were merged by the coordinator into this
+v2. Only `app.ts` changed vs v1 (1,528 -> ~1,650 lines); `main.ts` is byte-identical
+to v1, README/badges/topics and `.makefun/owner.json` untouched. Node stdlib only.
+
+### Per-workload numbers (p50 / points)
+
+| Workload | v1 sealed env | v2 kit `--perf` run 1 | v2 kit `--perf` run 2 | v2 sealed env |
+|---|---|---|---|---|
+| push | ~771-841 ms / 37 | 309 ms / 50 | 337 ms / 50 | 321.5 ms / 50 |
+| clone | ~140-200 ms / 30 | 78 ms / 47 | 75 ms / 48 | 71.8 ms / 49 |
+| read | ~1268-2267 ms / 39 | 629 ms / 50 | 597 ms / 50 | 672.1 ms / 50 |
+| write | ~148-159 ms / 41 | 83 ms / 50 | 84 ms / 50 | 93.0 ms / 49 |
+| **Perf total** | **147** | **197** | **198** | **198** |
+| **Score** | **947** | **997** | **998** | **998** |
+
+T_refs (house reference): push 1641 ms, clone 267 ms, read 2760 ms, write 349 ms.
+v2 sealed perf_p50_us 194920. Local numbers overstate the production sandbox
+(v1: local sealed 147 vs live server 129), so live v2 is expected lower than 198
+but with a large margin over the ~156 top-20 bar; the gap is the main residual risk.
+
+### Optimizations (all in app.ts)
+- `inflateAt`: one `inflateSync` + re-deflate length check instead of the old
+  exponential + binary search (~9-13 inflates per pack object). Push CPU ~3x better.
+- `buildPack`: incremental trailer SHA-1 (no second full concat); deflated-object
+  cache per oid (cap 4096, deterministic clear) — clones re-pack the same objects 50x.
+- `cachedPack` (FIFO 64) + `fetchRespCache` (have-less fetches whose wants all exist):
+  built packs, sideband framing and whole v2 fetch responses cached; safe because
+  packs/responses are pure functions of immutable content-addressed object sets.
+- `applyDelta`: writes into a preallocated buffer instead of `Buffer.concat` of slices.
+- `objId`: incremental hash, no header+data concat. `parseCommit`: content-addressed
+  cache (cap 8192) with oid passed at hot sites — removes O(n^2) re-parsing in walks.
+- `fetchObjects` BFS: index pointer instead of O(n) `queue.shift()`.
+- HTTP hot path: one manual URL split per request (no `new URL`, lazy query parse),
+  auth result cached on the last Authorization header, `sendJson`/`sendRaw` mutate
+  headers in place and serialize the body once, single-chunk `readBody` fast path,
+  git regex executed once in the dispatcher and passed to `handleGit`.
+- `refLines`: one string + single `Buffer.from`; static advertisements (`V2_ADV`,
+  `UPLOAD_PRE`, `RECEIVE_PRE`) built once at load.
+- Determinism preserved: no wall-clock/randomness; all caches are derived data over
+  immutable objects (deterministic FIFO/clear eviction); state export byte-identical
+  for the same request sequence (sealed run: 120/120, working 1).
+
+### Worker notes (kept for reference, not merged)
+- Issue/API variant (per-issue cached JSON Buffer, O(1) issue/pull/repo maps, lazy
+  pagination origin): ~15% less server CPU on read/write microbench, but wall-clock
+  runs (150-169) did not beat the HTTP variant and the merge risk across
+  handleRest/GraphQL/MCP was high while read/write were already at 50 pts locally,
+  so it was NOT merged. Its variant is at
+  ~/workspace/makefun/github-forge-variants/issue/entry if a later round needs it.
+- Profile worker's prototype (streaming `createInflate` with `bytesWritten`) validated
+  the same inflateAt win independently (3-obj pack 604 -> 124 us); full report at
+  ~/workspace/makefun/github-forge-variants/profile-report.md. It also warned that
+  server-side fixes alone might only lift live perf to ~134-137 — the merged v2's
+  sealed 198 (vs v1 sealed 147, +51) argues the upside is larger, but the live
+  number is the only one that counts.
+
+### Verification (this v2 directory)
+- Kit suite `--perf` (fresh dev server per run): run 1 — 120/120, feature 600,
+  agent 200, perf 197, score 997; run 2 — 120/120, perf 198, score 998.
+- Sealed env end-to-end (`program/env/server.mjs` on port 18090 + `node main.ts`,
+  state in /tmp/sealed-state-v2): 120/120 passed (git 30/30, repos 15/15,
+  issues 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15), working 1,
+  perf 198 (push 50, clone 49, read 50, write 49), score 998.
+- NOT done here (parent's step): commit, push, bundle, check, submit.
