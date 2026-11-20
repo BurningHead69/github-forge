@@ -202,3 +202,54 @@ but with a large margin over the ~156 top-20 bar; the gap is the main residual r
   issues 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15), working 1,
   perf 198 (push 50, clone 49, read 50, write 49), score 998.
 - NOT done here (parent's step): commit, push, bundle, check, submit.
+
+## v3 — streaming inflateAt (2026-11-20, fix #1 only)
+
+Live v2 score was 927 (perf 127, median 553 ms), rank 4420; top-20 cutoff 958
+(perf 158). Profiling (~/workspace/makefun/github-forge-variants/profile-report.md
+§4 fix #1) found `inflateAt` the largest single server lever, but estimated all
+server-side fixes #1–#4 together only lift live perf 129 → ~134–137 — below the
+~156 needed. Honest expectation for this v3 is ~932–935 live: still outside the
+paid top 20. It was built anyway because the user explicitly chose "gas v3 fix #1"
+on 2026-11-20 08:02 WIB. Only `app.ts` changed vs v2; `main.ts` and everything
+else are byte-identical (`diff -r` clean apart from app.ts/NOTES.md).
+
+### Change (app.ts only)
+- `inflateAt` is now async streaming: one `zlib.createInflate()` per object, the
+  pack remainder written once, `await` the `end` event. The inflate stops at the
+  end of the stream and trailing bytes stay buffered in `writableLength`, so
+  `inflate.bytesWritten` is exactly the consumed input length — verified
+  empirically on Node 24.22.1 before integrating (51-byte stream + 16 trailing
+  bytes → bytesWritten 51; also levels 0/1/6/9, empty and 100 KiB objects;
+  truncated stream → `error` event). This replaces v2's one-inflate + re-deflate
+  length check (and the old exponential + binary-search fallback) with a single
+  pass and no re-inflate.
+- `parsePack` is now `async`; its only caller (the async receive-pack handler in
+  `handleGit`) awaits it. No other callers, no other behaviour change.
+- Determinism preserved: no wall-clock/randomness; same request sequence leaves
+  the same state.
+
+### Verification (this v3 directory)
+- Direct pack round-trip with a real git client (3-commit delta-heavy push, then
+  clone back): oids and trees byte-identical. NOTE: the real git client reports
+  `fatal: protocol error: bad line length character: unpa` on the push response
+  while the server applies the push correctly — this is pre-existing in v2
+  (identical behaviour verified against the v2 server), not a v3 regression; the
+  kit's own git client (what grading uses) passes git 30/30.
+- Kit suite `--perf`, fresh dev server per run: run 1 — 120/120, feature 600,
+  agent 200, perf 164 (push 47, clone 38, read 39, write 40), score 964;
+  run 2 — 120/120, perf 168 (push 50, clone 40, read 38, write 40), score 968.
+  Same-day A/B vs v2 (fresh server, same VM conditions): v2 120/120, perf 167
+  (push 45, clone 39, read 41, write 42), score 967. The shared VM is noisy
+  today (v2 itself measures 167, not its earlier 197–198); v3 push is
+  consistently faster than v2 same-day (400–472 ms vs 551 ms), other workloads
+  within run-to-run variance.
+- Sealed env end-to-end (`program/env/server.mjs` on port 18090 + `node main.ts`,
+  state in /tmp/sealed-state-v3): 120/120 passed, working 1, perf 165
+  (push 45 @ 548.3 ms, clone 37 @ 140.0 ms, read 42 @ 1093.2 ms, write 41 @
+  147.0 ms), perf_p50_us 333268, score 965.
+- Typecheck note: `tsc --noEmit` reports one pre-existing error at app.ts:134
+  (`author` not in `CommitInfo`) — identical in v2, unrelated to this change;
+  the kit runs via `--experimental-strip-types` (no typecheck) and the suite
+  passes 120/120, so it was left untouched.
+- NOT done here (parent's step): commit, push, bundle, check, submit.

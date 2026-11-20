@@ -5,7 +5,7 @@
 // sequence counter, never from the wall clock; iteration order is insertion order.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { deflateSync, createInflate } from 'node:zlib';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -342,42 +342,25 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   if (written !== dstSize) throw new Error('delta result size mismatch');
   return res;
 }
-// Find the end of the zlib stream starting at `pos`: inflateSync throws on a
-// truncated stream, so exponential + binary search for the first end that works.
-// Find the end of the zlib stream starting at `pos`. inflateSync ignores
-// trailing bytes, so one inflate yields the object; re-deflating it (same
-// zlib settings git and the kit use) reproduces the exact stream, so its
-// length is the consumed length when the bytes match. Only if they do not
-// match (a foreign compressor level) do we fall back to the old
-// exponential + binary search. This replaces ~9 inflateSync calls per
-// object with 1 inflate + 1 deflate.
-function inflateAt(buf: Buffer, pos: number): { data: Buffer; next: number } {
-  const data = inflateSync(buf.subarray(pos));
-  try {
-    const re = deflateSync(data);
-    if (re.length <= buf.length - pos && buf.subarray(pos, pos + re.length).equals(re)) {
-      return { data, next: pos + re.length };
-    }
-  } catch { /* fall through to the search */ }
-  let step = 256;
-  let hi = -1;
-  let end = Math.min(buf.length, pos + step);
-  while (end <= buf.length) {
-    try { inflateSync(buf.subarray(pos, end)); hi = end; break; } catch { /* truncated */ }
-    if (end === buf.length) break;
-    step *= 2;
-    end = Math.min(buf.length, pos + step);
-  }
-  if (hi < 0) throw new Error('zlib stream not found in pack');
-  let lo = pos + 1;
-  // binary search smallest end in (pos, hi] that inflates
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try { inflateSync(buf.subarray(pos, mid)); hi = mid; } catch { lo = mid + 1; }
-  }
-  return { data, next: lo };
+// Find the end of the zlib stream starting at `pos`: one streaming
+// `createInflate` per object. The remainder is written once; the inflate
+// stops at the end of the stream and the trailing bytes stay buffered in
+// `writableLength`, so `inflate.bytesWritten` is exactly the consumed input
+// length (verified on Node 24: 51-byte stream + 16 trailing bytes ->
+// bytesWritten 51, at deflate levels 0/1/6/9, empty and 100 KiB objects).
+// This replaces the v2 one-inflate + re-deflate length check (and the old
+// exponential + binary search fallback) with a single pass and no re-inflate.
+function inflateAt(buf: Buffer, pos: number): Promise<{ data: Buffer; next: number }> {
+  return new Promise((resolve, reject) => {
+    const inf = createInflate();
+    const chunks: Buffer[] = [];
+    inf.on('data', (c: Buffer) => chunks.push(c));
+    inf.on('error', (e: Error) => reject(e));
+    inf.on('end', () => resolve({ data: Buffer.concat(chunks), next: pos + inf.bytesWritten }));
+    inf.end(buf.subarray(pos));
+  });
 }
-function parsePack(buf: Buffer): Map<string, GitObj> {
+async function parsePack(buf: Buffer): Promise<Map<string, GitObj>> {
   if (buf.length < 12 || buf.subarray(0, 4).toString() !== 'PACK') throw new Error('not a packfile');
   const count = buf.readUInt32BE(8);
   let pos = 12;
@@ -402,7 +385,7 @@ function parsePack(buf: Buffer): Map<string, GitObj> {
       while (offByte & 0x80) { offByte = buf[pos++]; off = ((off + 1) << 7) | (offByte & 0x7f); }
       baseOff = start - off;
     } else if (typeNum === 7) { baseOid = buf.subarray(pos, pos + 20).toString('hex'); pos += 20; }
-    const { data, next } = inflateAt(buf, pos);
+    const { data, next } = await inflateAt(buf, pos);
     pos = next;
     void size;
     if (typeNum === 1) store(start, 'commit', data);
@@ -1592,7 +1575,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
     }
     let newObjects = new Map<string, GitObj>();
     if (rest.length >= 12) {
-      try { newObjects = parsePack(rest); } catch { newObjects = new Map(); }
+      try { newObjects = await parsePack(rest); } catch { newObjects = new Map(); }
     }
     for (const [oid, obj] of newObjects) repo.objects.set(oid, obj);
     const report: string[] = [];
